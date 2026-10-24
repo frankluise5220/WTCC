@@ -1,0 +1,64 @@
+# 云端编译 WTCC 固件 → 产出 OTA 用的 .bin
+#
+# 为什么在这儿编：本机没有 Arduino 工具链，固件原本在另一台装了 IDE 的机器上手工导出。
+# 走 GitHub Actions 后本地零安装，push 即出 bin，artifact 里直接下。
+#
+# 编译参数【必须】与本地 IDE 完全一致，否则尺寸和实际行为都可能不同：
+#   抄自 WTCC_firmware/build/esp32.esp32.esp32/build.options.json（2026-10-23 实测）
+#   core = esp32:esp32@3.3.12 ｜ 优化 -Os ｜ 第三方库只有 PubSubClient
+name: build
+
+on:
+  push:
+  workflow_dispatch:      # 也可以在网页上手动点一次
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # core 有 1.5GB 左右，不缓存的话每次都重下。缓存键带上 core 版本和库名，
+      # 换了版本自动失效重建。
+      - name: Cache arduino core
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ runner.os }}-esp32-3.3.12-pubsubclient-v1
+
+      - uses: arduino/setup-arduino-cli@v1
+
+      - name: Install core and libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.12
+          arduino-cli lib install PubSubClient
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32:UploadSpeed=921600,CPUFreq=240,FlashFreq=80,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=disabled,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default" \
+            --warnings default \
+            --output-dir out \
+            WTCC_firmware
+
+      # 打印尺寸，和本地 IDE 的 "Sketch uses ... of 1310720" 对照用
+      - name: Report size
+        run: |
+          echo "=== 产物 ==="
+          ls -l out/*.bin
+          echo "=== 占用率（app 分区上限 1310720）==="
+          stat -c '%s %n' out/WTCC_firmware.ino.bin | \
+            awk '{printf "%s = %d 字节 = %.1f%% of 1310720\n", $2, $1, $1*100/1310720}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wtcc-bin-${{ github.run_number }}
+          path: |
+            out/WTCC_firmware.ino.bin
+            out/WTCC_firmware.ino.merged.bin
+          if-no-files-found: error

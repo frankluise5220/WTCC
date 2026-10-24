@@ -1,0 +1,8 @@
+# 只把「固件源码 + CI 配置」推到 GitHub 做云编译，其余一律不跟踪。
+# 项目根目录里有大量图片、文档、_bin 归档、build 产物（37MB+），全都不该进仓库。
+/*
+!/.gitignore
+!/.github/
+!/WTCC_firmware/
+/WTCC_firmware/*
+!/WTCC_firmware/WTCC_firmware.ino
