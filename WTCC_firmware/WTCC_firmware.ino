@@ -1,4 +1,4 @@
-/* v5.21 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.22 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -67,11 +67,12 @@
 #include <ArduinoOTA.h>    // v5.7 IDE 无线烧录：端口列表里出现 "WTCC at 192.168.x.x"
 #include <HTTPClient.h>    // v5.10 URL 升级：从 http(s) 地址直接拉 .bin
 #include <WiFiClientSecure.h>  // v5.10 https 下载（setInsecure，见 otaFromUrl 注释）
+/* ⚠ 下面这句 #define 对库**不生效**，别指望它。
+ * PubSubClient.cpp 是独立编译的翻译单元，看不到 .ino 里的宏，库内部仍是默认 256 字节。
+ * 真正管用的是运行时的 mqtt.setBufferSize(1024)（在 mqttConnect() 里）
+ * + tryPub() 里显式传长度（绕开库内 strnlen 截断）。详见 tryPub 上方注释。 */
 #define MQTT_MAX_PACKET_SIZE 1024
 #include <PubSubClient.h>
-#if MQTT_MAX_PACKET_SIZE < 1024
-#error "MQTT_MAX_PACKET_SIZE must be >= 1024 (copy the #define line above #include <PubSubClient.h>)"
-#endif
 
 /* 版本号规则：每次改动必须动这里。
  *   FW_VER   —— 语义版本（软件），改动累计到一定程度进一位
@@ -80,7 +81,7 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.21"
+#define FW_VER   "v5.22"
 #define FW_BUILD __DATE__ " " __TIME__
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
@@ -192,6 +193,30 @@
  *   · runPhase() 把这些回执也归到「手动」大字，否则大字会先掉回「待机」
  *   · 网页的 showSrc 加上 `phase=='手动'`，回执才挂得上「 · 网页」
  *   · 流程跑完回 IDLE 时把 manSt/runSrc 复位，免得流程结束后还挂着上一轮回执
+ */
+
+/* ======== v5.22：修 HA 发现报文超 256 字节发不出去（v5.21 引入的回归）========
+ * 症状：OTA 到 v5.21 后 /state 的 pubfail 一直挂着 19，点网页「重发发现」19→38，
+ *   HA 里实体（T0~T5、四路开关、水位、漏水…）全部不刷新。
+ * 定位：写脚本把 21 条 discovery 报文的
+ *   5(固定头) + 2 + strlen(topic) + strlen(payload)
+ *   全算了一遍 —— 最长 331 字节（number 的 T2/T4/T5），正好 18 条超 256，
+ *   而仅有的 3 条短报文（run_fill / done / last，用 devS 短 device）都发得出去。
+ *   完全对得上「19 条失败」。
+ * 根因（两层，缺一不可地踩中了）：
+ *   1. PubSubClient.cpp 是**独立编译**的翻译单元，看不到 .ino 里的
+ *      #define MQTT_MAX_PACKET_SIZE 1024 —— 那个宏只对 .ino 自己这份生效。
+ *      所以库内 bufferSize 一直是默认 256。
+ *   2. publish(topic, payload, retained) 在库内部用 strnlen(payload, 256) 取长度，
+ *      超长报文先被截成 256，再被 bufferSize 检查判「太长」，直接 return false。
+ *   为什么 v5.21 才炸：v5.21 给 device 加了 manufacturer/model/hw_version/sw_version，
+ *      从 66 字节涨到 153 字节，每条报文 +87 —— 原本 218~244 的报文全被顶过 256。
+ * 修法：
+ *   · mqttConnect() 里 mqtt.setBufferSize(1024)（运行时，改的是库内成员）
+ *   · tryPub() 改成 publish(topic, (const uint8_t*)p, strlen(p), true) 显式传长度
+ * ⚠ 教训：#define 一个库的配置宏，只有在**库自己也用这个宏**且**在库的编译单元里可见**时才有效。
+ *   .ino 里 define 库宏 = 基本无效。要么改库源码，要么找库提供的运行时 setter。
+ * ⚠ 以后再加长 device / 实体名，先算一遍报文长度，别超 1024（现在还有 3 倍余量）。
  */
 
 /* ======== v5.21：给板子一个固定的硬件型号 ========
@@ -1362,8 +1387,19 @@ String cfgJson() {
 // ---- MQTT 发现（每条≤240B） ----
 // 注意：不做 delay 重试。publish 失败（尤其半开连接）时若还 delay 重试，
 // 20+ 条 discovery 会把 loop 堵死几十秒，直接拖垮网页。失败就返回，交给上层计数。
+/* v5.22：必须走「显式长度」这个重载，不能用 publish(topic, payload, retained)。
+ * 原因（踩过的坑，别再改回去）：
+ *   PubSubClient.cpp 是**独立编译**的翻译单元，看不到 .ino 里那句
+ *   #define MQTT_MAX_PACKET_SIZE 1024 —— 那个宏只对 .ino 自己这一份生效。
+ *   于是库里的
+ *     publish(topic, (const uint8_t*)payload, strnlen(payload, MQTT_MAX_PACKET_SIZE), retained)
+ *   用的是库自己的 256，超长报文被截到 256，再被 bufferSize 检查判为「太长」直接返回 false。
+ *   现象：21 条 HA 发现里 19 条发不出去（pubfail 每次广播 +19），实体不更新。
+ * 修法：这里自己算 strlen 传进去，同时在 mqttConnect() 里 setBufferSize(1024)。
+ *   两处都要，只改一处没用。 */
 bool tryPub(const char* topic, const char* payload) {
-  if (mqtt.publish(topic, payload, true)) return true;
+  size_t n = strlen(payload);
+  if (mqtt.publish(topic, (const uint8_t*)payload, (unsigned int)n, true)) return true;
   return false;
 }
 void mqttPubDiscovery() {
@@ -1461,6 +1497,16 @@ void mqttPubStates() {
 void mqttConnect() {
   if (!mqttEn || mqttHost[0] == 0) return;
   mqtt.setServer(mqttHost, mqttPort);
+  /* v5.22 修 bug：HA 发现报文超 256 字节，21 条里 19 条发不出去。
+   * 现象：/state 的 pubfail 每次发现广播 +19（点「重发」19→38），HA 里实体不刷新。
+   * 根因：PubSubClient.cpp 独立编译，看不到 .ino 里的 #define MQTT_MAX_PACKET_SIZE 1024，
+   *   库内 bufferSize 仍是默认 256；而 publish(topic,payload,retained) 又用库内的
+   *   strnlen(payload,256) 截断 —— 双重打击，超长报文直接返回 false。
+   *   单条最长 331 字节（T2/T4/T5 的 number，含 device 段 153 字节）。
+   *   v5.21 把 device 从 66 扩到 153 字节，正好把 18 条顶过 256 → 这是 v5.21 的回归。
+   * 修法：这里 setBufferSize(1024) + tryPub() 显式传长度，两处缺一不可。
+   * ⚠ 以后再加长 device / 实体名，先算 5+2+strlen(topic)+payload 有没有超这个值。 */
+  mqtt.setBufferSize(1024);
   if (mqtt.connect("esp-pump", mqttUser, mqttPass)) {
     mqtt.subscribe("esp-pump/cmd");
     mqtt.subscribe("esp-pump/relay1/set");
