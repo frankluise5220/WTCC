@@ -1,4 +1,4 @@
-/* v5.24 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.25 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -81,7 +81,7 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.24"
+#define FW_VER   "v5.25"
 #define FW_BUILD __DATE__ " " __TIME__
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
@@ -217,6 +217,31 @@
  * ⚠ 教训：#define 一个库的配置宏，只有在**库自己也用这个宏**且**在库的编译单元里可见**时才有效。
  *   .ino 里 define 库宏 = 基本无效。要么改库源码，要么找库提供的运行时 setter。
  * ⚠ 以后再加长 device / 实体名，先算一遍报文长度，别超 1024（现在还有 3 倍余量）。
+ */
+
+/* ======== v5.25：修 HA 实体全部消失 —— 发现报文少了外层 `}`（v5.21 引入）========
+ * 症状：OTA 到 v5.22 之后，HA 里 21 个实体陆续消失；板子侧却一切正常
+ *   （mqtt=1、mqttEn=1、pubfail=0），broker 上 21 条保留报文也都在。
+ * 定位：把 broker 上的保留报文抓下来逐条 json.loads —— 21 条**全部**失败，
+ *   报错一律 `Expecting ',' delimiter`。报文结尾只有一个 `}`：
+ *     {"name":"流程完成",...,"device":{"identifiers":["esp-pump"],"model":"WTCC-ESP32-RLY4"}
+ *   只闭合了内层 device，外层 JSON 对象永远没闭合。
+ *   交叉验证：按源码算 done/config 的 payload 长度 = 170 字节，broker 上实测也是 170
+ *   → 不是传输截断，是源字符串本身就少一个字符。
+ * 根因：v5.21 给 device 加 manufacturer/hw_version/sw_version 时重写这两行，
+ *   把结尾的 "}} 写成了 "}：
+ *     错  + FW_VER  + R"rawliteral("})rawliteral";
+ *     错  + HW_MODEL + R"rawliteral("})rawliteral";
+ *     对  + FW_VER  + R"rawliteral("}})rawliteral";
+ *     对  + HW_MODEL + R"rawliteral("}})rawliteral";
+ *   前一个 } 闭 device，后一个 } 闭整条 config。
+ * 为什么 v5.21 当时没全崩：v5.21 只发得出 3 条（boot/done/last），其余 18 条超 256 字节
+ *   发不出去，所以那 18 个实体还挂着 v5.20 的旧好报文；v5.22 修好发送之后，
+ *   21 条坏报文一起覆盖上去，实体才全灭。两个 bug 叠在一起，把爆发点推后了一个版本。
+ * 修法：两处各补一个 }。unique_id 没变，正确的保留报文覆盖坏的之后 HA 自动重建实体，
+ *   不用重启 HA、不用重新配对。
+ * ⚠ 教训：device 这种「字符串拼 JSON」的活，肉眼数括号不可靠。改完必须跑
+ *   `_tools/check_discovery.py`（源码 → 21 条 payload → 逐条 json.loads），它比人眼可靠。
  */
 
 /* ======== v5.21：给板子一个固定的硬件型号 ========
@@ -835,7 +860,7 @@ void leakReset(const char* src);
  * 从此之后整个文件的解析都是错位的，后面定义的函数能不能拿到隐式原型纯看运气
  * （v5.8 能过、v5.11 报 httpSelfTest 未声明，就是 HTML 长度变了、错位落点跟着变）。
  * 规矩：凡是"先用后定义"的函数，一律在这里显式声明，不要依赖 IDE。 */
-void save();           // wifiFactoryReset() 在 L646 调它，save() 定义在后面
+void save();           // factoryReset() 在 L940 附近调它，save() 定义在后面
 void httpSelfTest();   // doCmd 的 selftest 分支调它，定义在 handleRoot() 的大 rawliteral 之后
 
 /* ================= v5.17：状态卡片两行各管一件事 =================
@@ -887,8 +912,7 @@ void ledSet(bool on) { digitalWrite(LED_STATUS, LED_ACTIVE_HIGH ? on : !on); }
 
 #define BTN_STOP_MS      3000UL   // BOOT 长按 3s：急停 + 解除漏水锁定
 #define BTN_RESTART_MS   6000UL   // BOOT 长按 6s：松手即重启（保留全部配置）
-#define BTN_WIFIRESET_MS 10000UL  // BOOT 超长按 10s：网络复位（清 WiFi 重开热点）+ 重启
-#define WIFI_RESET_CLEARS_MQTT 0  // 网络复位时是否一并清掉 MQTT 配置：1=清，0=保留（默认）
+#define BTN_WIFIRESET_MS 10000UL  // BOOT 超长按 10s：恢复出厂设置（清空全部配置）+ 重启
 // 0=无提示 1=急停窗口(3~6s) 2=重启窗口(6~10s)，LED 用不同闪速区分
 byte btnWarn = 0;
 
@@ -926,17 +950,41 @@ bool startAP() {
   return WiFi.softAP("FS_TWCC");          // 再试一次；还失败就交给 5 秒后的自愈巡检重试
 }
 
-// 网络出厂复位：只清 WiFi（SSID/密码/wifiMode）并重开配网热点 FS_TWCC，
-// 保留 T0~T5、定时计划与互斥/保护逻辑 —— 换路由器或改 WiFi 密码时不用重新配一堆参数。
-void wifiFactoryReset() {
-  evLog("BTN", "10s 网络复位：清 WiFi，重开热点");
+/* 恢复出厂设置（BOOT 按住 10 秒）：把 EEPROM 里**所有**可配置项写回默认值，
+ * 重开配网热点 FS_TWCC 后重启。清完就是一块刚刷好固件的新板子。
+ *
+ * v5.25 之前这里叫 wifiFactoryReset()，只清 WiFi 三字段，计划 / MQTT / T0~T5 /
+ * 水位极性全都留着 —— 但界面上写的是「恢复出厂设置」，名不副实。
+ * 现在真清，清单见下（与 save() 的 EEPROM 布局一一对应，别漏）：
+ *   网络   ssid / pass / wifiMode
+ *   MQTT   mqttEn / host / user / pass / port
+ *   计划   planCount + 全部 8 条的 en/type/param/hour/min/obj/ref
+ *   时序   T0=5 T1=20 T2=20 T4=120 T5=120
+ *   开关   trig=1（上电待机）objGlobal=0（换水）
+ *   极性   senAPol / senBPol 回编译期默认（IN1、IN2 都是「通路时触发」）
+ * ⚠ 清完 WiFi 就断了，只能手机连 FS_TWCC 重新配网；T4 这类调过的参数也一并回默认。 */
+void factoryReset() {
+  evLog("BTN", "10s 恢复出厂设置：清空全部配置");
+  Serial.println("[BTN] 10s 恢复出厂设置");
   applyRelays(0, 0, 0, 0);                 // 先把输出全放掉，别带着负载重启
   st = IDLE; leakLatch = false;
-  manSt = "WiFi 已复位";
-  ssid[0] = 0; pass[0] = 0; wifiMode = 0;  // 只动网络三字段
-#if WIFI_RESET_CLEARS_MQTT
-  mqttEn = 0; mqttHost[0] = 0; mqttUser[0] = 0; mqttPass[0] = 0;
-#endif
+  manSt = "已恢复出厂"; runSrc = "";
+  doneFlag = false; endHandled = false; lastResult[0] = 0;
+  // 网络
+  ssid[0] = 0; pass[0] = 0; wifiMode = 0;
+  // MQTT
+  mqttEn = 0; mqttHost[0] = 0; mqttUser[0] = 0; mqttPass[0] = 0; mqttPort = 1883;
+  // 定时计划：一条不留
+  planCount = 0;
+  for (int i = 0; i < MAX_PLAN; i++) {
+    planEn[i] = 0; planType[i] = 0; planParam[i] = 0;
+    planHour[i] = 0; planMin[i] = 0; planObj[i] = 0; planRef[i] = 0;
+  }
+  // 时序与开关
+  cfgT0 = 5; cfgT1 = 20; cfgT2 = 20; cfgT4 = 120; cfgT5 = 120;
+  trig = 1; objGlobal = 0;
+  // 水位判定极性
+  senAPol = SEN_A_TRIG_LOW; senBPol = SEN_B_TRIG_LOW;
   save();
   for (byte i = 0; i < 6; i++) { ledSet(true); delay(100); ledSet(false); delay(100); }  // 急闪 6 下提示
   WiFi.disconnect();
@@ -949,7 +997,7 @@ void wifiFactoryReset() {
 //   短按 <3s       执行一次换水
 //   按住 >=3s      急停：强制停止全部输出 + 解除漏水锁定（立即执行，不用松手）
 //   6~10s 之间松手 重启：保留 WiFi/计划/MQTT 全部配置
-//   按住 >=10s     网络复位：清 WiFi 重开热点 FS_TWCC，然后重启
+//   按住 >=10s     恢复出厂设置：清空 WiFi / MQTT / 计划 / T0~T5 / 极性，重开热点 FS_TWCC 后重启
 // 6s 档特意做成「松手触发」：若一按到 6s 就立即重启，就永远按不到 10s 的复位档。
 void btnTask() {
   static bool lastLv = HIGH;
@@ -979,7 +1027,7 @@ void btnTask() {
       if (!stopDone) { leakReset("BTN"); manSt = "急停"; stopDone = true; }  // 急停全关 + 解锁漏水
       btnWarn = (held >= BTN_RESTART_MS) ? 2 : 1;
     }
-    if (held >= BTN_WIFIRESET_MS) wifiFactoryReset();  // 10s：清 WiFi + 重启
+    if (held >= BTN_WIFIRESET_MS) factoryReset();     // 10s：恢复出厂设置（清空全部配置）+ 重启
   }
   lastLv = now;
 }
@@ -1426,9 +1474,9 @@ void mqttPubDiscovery() {
    *   先查是不是这里太长把某条 discovery 顶爆了。 */
   String dev = String(R"rawliteral("device":{"identifiers":["esp-pump"],"name":"换水控制器","manufacturer":"WTCC","model":")rawliteral")
              + HW_MODEL + R"rawliteral(","hw_version":")rawliteral" + HW_REV
-             + R"rawliteral(","sw_version":")rawliteral" + FW_VER + R"rawliteral("})rawliteral";
+             + R"rawliteral(","sw_version":")rawliteral" + FW_VER + R"rawliteral("}})rawliteral";
   String devS = String(R"rawliteral("device":{"identifiers":["esp-pump"],"model":")rawliteral")
-              + HW_MODEL + R"rawliteral("})rawliteral";
+              + HW_MODEL + R"rawliteral("}})rawliteral";
   if (!tryPub("homeassistant/switch/esp-pump/boot/config",
     (String(R"rawliteral({"name":"开机启动","unique_id":"esp-pump_boot","state_topic":"esp-pump/boot","command_topic":"esp-pump/boot/set","payload_on":"ON","payload_off":"OFF",)rawliteral") + devS).c_str())) dispubFail++;
   if (!tryPub("homeassistant/binary_sensor/esp-pump/floatA/config",
@@ -1915,13 +1963,17 @@ input{width:100%;height:40px;font-size:14px;border:1px solid var(--line);border-
 .pop .pbody p{margin:0 0 10px}
 .pop .pbody b{color:#0f172a}
 .pop .pclose{width:100%;margin-top:6px}
-/* BOOT 键功能表（网络设置卡片底部） */
+/* BOOT 键功能表（记录页） */
 .kbt{width:100%;border-collapse:collapse;margin-top:10px;font-size:11.5px;line-height:1.5}
 .kbt th{font-weight:600;color:var(--muted);text-align:left;padding:4px 6px;background:#f8fafc;border-bottom:1px solid var(--line)}
 .kbt td{padding:6px;border-bottom:1px solid var(--line);vertical-align:top;color:#334155}
 .kbt tr:last-child td{border-bottom:0}
-.kbt td:first-child{white-space:nowrap;font-weight:600;color:var(--ink);width:66px}
+.kbt td:first-child{white-space:nowrap;font-weight:600;color:var(--ink);width:46px}
 .kbt .fn{color:#0f172a;font-weight:600}
+/* 状态灯单独一列：原来塞在「功能」格里当灰色小字，一行里两件事混着看。
+   列宽固定 + nowrap，窄屏（320）下也不会把「急闪 6 下」拆成两行。 */
+.kbt .led{width:64px;white-space:nowrap;color:#64748b}
+.kbt th.led{color:var(--muted)}
 /* 事件日志（v5.6）：最近动作列表 */
 .evlist{max-height:230px;overflow-y:auto;background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:6px 8px}
 .evrow{display:flex;gap:8px;align-items:flex-start;padding:4px 0;border-bottom:1px dashed #e2e8f0;font-size:12px;line-height:1.5}
@@ -2026,11 +2078,11 @@ input{width:100%;height:40px;font-size:14px;border:1px solid var(--line);border-
 <div class="card" data-pane="2"><h3>BOOT 键功能</h3>
 <p class="tip" style="margin-top:0"><b>先认键</b>：板子底边、<b>Type-C 口旁边并排两颗小按钮</b>。<b>左边那颗（丝印 IO0）是 BOOT</b> —— 就是本表讲的键；右边那颗（丝印 EN）是 RESET，纯硬件复位，固件不接管，按一下等于断电重启。两颗按钮靠得很近，别按错。</p>
 <table class="kbt">
-<tr><th>按住 BOOT（左边 IO0）</th><th>功能</th></tr>
-<tr><td>&lt; 3 秒</td><td><span class="fn">开始一次换水</span></td></tr>
-<tr><td>3 秒</td><td><span class="fn">急停</span> · 断开全部输出，并解除漏水锁定<br><span style="color:#64748b">状态灯中速闪</span></td></tr>
-<tr><td>6 秒</td><td><span class="fn">松手重启</span> · 保留 WiFi、计划、MQTT 全部配置<br><span style="color:#64748b">状态灯快速闪</span></td></tr>
-<tr><td>10 秒</td><td><span class="fn">恢复出厂</span> · 清空 WiFi 配置，重开热点 FS_TWCC 并重启<br><span style="color:#64748b">状态灯急闪 6 下（计划与 MQTT 保留）</span></td></tr>
+<tr><th>按住</th><th>功能</th><th class="led">状态灯</th></tr>
+<tr><td>&lt; 3 秒</td><td><span class="fn">开始一次换水</span></td><td class="led">常亮</td></tr>
+<tr><td>3 秒</td><td><span class="fn">急停</span> · 断开全部输出，并解除漏水锁定</td><td class="led">中速闪</td></tr>
+<tr><td>6 秒</td><td><span class="fn">重启</span></td><td class="led">快速闪</td></tr>
+<tr><td>10 秒</td><td><span class="fn">恢复出厂设置</span></td><td class="led">急闪 6 下</td></tr>
 </table>
 <p class="tip">先正常上电再按住。<b>切勿按住 BOOT 上电</b>，那样会进入下载模式。清空 WiFi 后，手机连 <b>FS_TWCC</b> 重新配网。</p></div>
 <div class="card" data-pane="3"><h3>固件升级<span class="cardbadge off" id="fwBadge"><i></i>v-</span></h3>
@@ -3010,7 +3062,7 @@ void loop() {
   serialCli();       // v5.3i：串口命令行（排障通道，绕开 HTTP 直接下命令）
   mbPoll();          // Modbus RTU 从机：保持成品板 RS485 上位机可用
   ledTask();         // 系统状态灯（唯一的软件可控 LED）
-  btnTask();         // 板载 BOOT 键：短按换水 / 长按(3s)急停 / 超长按(10s)网络复位
+  btnTask();         // 板载 BOOT 键：短按换水 / 长按(3s)急停 / 6s 重启 / 超长按(10s)恢复出厂设置
   leakTask();        // 浸水传感器（IN3）：最高优先级安全保护
   rcTask();          // 单键遥控（IN4）：1击排水 / 2击上水 / 3击换水 / 长按急停
   if (mqttEn && mqttHost[0] != 0) {
