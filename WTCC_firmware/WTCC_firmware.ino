@@ -1,4 +1,4 @@
-/* v5.23 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.24 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -81,7 +81,7 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.23"
+#define FW_VER   "v5.24"
 #define FW_BUILD __DATE__ " " __TIME__
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
@@ -1274,16 +1274,27 @@ int dayNum() { return (int)(time(nullptr) / 86400); }
 
 // 计算某计划「下一次执行」的日期时间文本（供前端展示）。
 // 返回空串 = 无法计算（时间未同步 / 数据无效）。
+/* v5.24 修 bug：当天已经过了执行时刻，还会把「今天 08:00」当成下次。
+ *   例：周六 18:50 加一条「周三/周六 08:00」，显示「下次 10-24 08:00」——
+ *   10-24 就是今天，08:00 早过了，等于指着过去说下次。
+ *   根因：循环从 d=0（今天）开始，只比对**星期**，没比对**时刻**。
+ *   修法：d==0 时多判一次「现在是不是已经过了今天的 h:m」，过了就跳到下一天再找。
+ *   用严格大于（>）而不是大于等于：正好卡在 08:00 那一分钟里，显示今天这次（它正在跑），
+ *   比提前跳到下周更好理解；过了这一分钟自然就变成下一次。 */
 String nextRunText(int idx) {
   if (!timeSynced) return "";
   if (idx < 0 || idx >= planCount) return "";
   time_t now = time(nullptr);
   int h = planHour[idx], m = planMin[idx];
+  struct tm nowLt; localtime_r(&now, &nowLt);
+  int nowMin = nowLt.tm_hour * 60 + nowLt.tm_min;   // 当天已过的分钟数
+  int planMinOfDay = h * 60 + m;
   char buf[20];
   if (planType[idx] == 0) {   // 按周：从今天起往后找第一个命中的星期
     int wbit = planParam[idx];
     if (wbit == 0) return "";
     for (int d = 0; d < 8; d++) {
+      if (d == 0 && nowMin > planMinOfDay) continue;   // 今天这个点已经过了
       time_t t = now + (time_t)d * 86400;
       struct tm lt; localtime_r(&t, &lt);
       int wd = lt.tm_wday;                    // 0=周日
@@ -1299,6 +1310,7 @@ String nextRunText(int idx) {
     if (N <= 0 || planRef[idx] <= 0) return "";
     int today = dayNum();
     for (int d = 0; d < N + 1; d++) {
+      if (d == 0 && nowMin > planMinOfDay) continue;   // 同上：今天这个点已经过了
       int dn = today + d;
       if ((dn - planRef[idx]) % N == 0) {
         time_t t = now + (time_t)d * 86400;
