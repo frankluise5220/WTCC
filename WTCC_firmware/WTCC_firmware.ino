@@ -1,4 +1,4 @@
-/* v5.22 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.23 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -81,7 +81,7 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.22"
+#define FW_VER   "v5.23"
 #define FW_BUILD __DATE__ " " __TIME__
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
@@ -633,7 +633,10 @@ inline void rlyWrite(int pin, bool on) {
  * 实现：32 条环形缓冲，只存在 RAM，**重启即清空**（不写 EEPROM，避免擦写磨损）。
  *       每条格式 "来源|内容"，例如 "BTN|启动 换水" / "WEB|手动 阀开"。
  * 出口：① 串口实时打印 [EV ] 行；② GET /log 返回 JSON；③ 网页「最近动作」卡片。
- * 时间：联网校时后显示真实时钟（HH:MM:SS），未校时显示开机秒数（+123s）。
+ * 时间（v5.23 起）：一律显示真实时钟 HH:MM:SS。
+ *       记录时若还没校时（典型是开机第一条 BOOT），ep 存 0，读日志时用
+ *       「当前时钟 − (millis 差)」反推回来 —— 否则那条永远显示成 "+0s"。
+ *       只有「到读的时候还没校时」才退化成开机秒数 "+123s"。
  */
 #define EV_MAX 32
 #define EV_LEN 64
@@ -2404,19 +2407,30 @@ void handleCmd() {
 void handleState() { httpStateN++; lastHttpMs = millis(); server.sendHeader("Cache-Control", "no-store"); server.send(200, "text/plain", stateText()); }
 void handleCfg()   { httpCfgN++;   lastHttpMs = millis(); server.sendHeader("Cache-Control", "no-store"); server.send(200, "application/json", cfgJson()); }
 
-/* 事件日志查询：GET /log  →  [{ "t":"10:31:02", "x":"BTN|启动 换水" }, ...]（最旧→最新）
+/* 事件日志查询：GET /log  →  [{ "t":"17:44:12", "x":"BTN|启动 换水" }, ...]（最旧→最新）
  *                     /log?clear=1 → 清空后返回空数组
- * 时间字段：已联网校时给真实时钟；未校时给开机秒数 "+123s"。 */
+ * 时间字段：一律显示真实时钟（HH:MM:SS）。
+ *   v5.23：以前未校时的记录（典型是开机第一条 BOOT）显示 "+0s" 这种开机秒数，
+ *   看不出到底是什么时候发生的。现在**反过来算**：
+ *       事件时刻 = 当前时钟 − (现在 millis − 记录时的 millis)
+ *   只在校时完成后才算 —— 没校时就算出来也是 1970 年，那还不如显示 "+Ns" 说实话。
+ *   ⚠ 这个反推依赖 millis 不丢（ESP32 的 millis 是 64 位 micros 折算，49 天回绕，
+ *     用无符号减法 `nowMs - r.ms` 天然处理回绕，不用额外判断）。 */
 void handleLog() {
   lastHttpMs = millis();
   if (server.hasArg("clear")) { evHead = 0; evCnt = 0; }
+  time_t nowEpoch = time(nullptr);
+  uint32_t nowMs = millis();
   String s = "[";
   for (byte i = 0; i < evCnt; i++) {
     byte idx = (evHead + EV_MAX - evCnt + i) % EV_MAX;   // 从最旧读到最新
     EvRec& r = evBuf[idx];
     char tb[16];
-    if (r.ep) {
-      time_t t = (time_t)r.ep; struct tm tt; localtime_r(&t, &tt);
+    time_t t = 0;
+    if (r.ep) t = (time_t)r.ep;                          // 记录时就已校时，直接用
+    else if (timeSynced) t = nowEpoch - (time_t)((nowMs - r.ms) / 1000UL);   // 反推
+    if (t) {
+      struct tm tt; localtime_r(&t, &tt);
       snprintf(tb, sizeof(tb), "%02d:%02d:%02d", tt.tm_hour, tt.tm_min, tt.tm_sec);
     } else {
       snprintf(tb, sizeof(tb), "+%lus", (unsigned long)(r.ms / 1000UL));
