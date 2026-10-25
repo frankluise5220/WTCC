@@ -4,6 +4,25 @@
 
 当前版本：**v5.25**
 
+## 硬件
+
+本固件运行在现成的 **ESP32 四路 Modbus 继电器板**上（DOIT ESP32-32E 模组），购买同款板子即可直接烧录使用，无需自研 PCB。
+
+<div align="center">
+  <img src="docs/hardware/module_photo.jpg" alt="ESP32 四路 Modbus 继电器模块实物图" width="500">
+  <p><i>图：WTCC 控制器实物图（蓝板 + 绿色接线端子）</i></p>
+</div>
+
+| 项目 | 参数 |
+|---|---|
+| 主控模组 | DOIT ESP32-32E（ESP32-WROOM-32，双核 240MHz，4MB Flash） |
+| 板卡丝印 | ESP32_Relay_X4_Modbus_Shell_V1.1 |
+| 成品板系列 | KR0548-4CH（四路继电器版） |
+| 继电器 | 4× SRD-05VDC，干接点，可直接串接 220V 负载 |
+| 光耦输入 | 4× PC817，无源输入（低电平有效），电气隔离 |
+| 通信 | RS485（SP3485，Modbus RTU 从机）+ WiFi |
+| 供电 | Type-C（TPS54331 升压至 5V） |
+
 ## 功能特性
 
 ### 核心控制
