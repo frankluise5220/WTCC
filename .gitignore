@@ -6,3 +6,6 @@
 !/WTCC_firmware/
 /WTCC_firmware/*
 !/WTCC_firmware/WTCC_firmware.ino
+!/README.md
+!/docs/
+!/docs/screenshots/
