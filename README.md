@@ -6,25 +6,19 @@
 
 ## 软件界面
 
-### 控制页
-
-![控制页](docs/screenshots/shot_1_control.png)
-
-### 设置页
-
-![设置页](docs/screenshots/shot_2_settings.png)
-
-### 信息页
-
-![信息页](docs/screenshots/shot_3_info.png)
-
-### 系统页
-
-![系统页](docs/screenshots/shot_4_system.png)
-
-### 日志页
-
-![日志页](docs/screenshots/shot_5_log.png)
+<table>
+  <tr>
+    <td align="center"><b>控制页</b><br><img src="docs/screenshots/shot_1_control.png" width="360"></td>
+    <td align="center"><b>设置页</b><br><img src="docs/screenshots/shot_2_settings.png" width="360"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>信息页</b><br><img src="docs/screenshots/shot_3_info.png" width="360"></td>
+    <td align="center"><b>系统页</b><br><img src="docs/screenshots/shot_4_system.png" width="360"></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><b>日志页</b><br><img src="docs/screenshots/shot_5_log.png" width="360"></td>
+  </tr>
+</table>
 
 ## 目录结构
 
