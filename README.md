@@ -17,7 +17,7 @@
 ### 连接与控制
 
 - **网页控制**：内置 Web 界面（控制 / 设置 / 信息 / 系统 / 日志五个页签），支持局域网内直接操作与配置。
-- **MQTT**：完整主题订阅/发布，支持远程控制与状态上报。
+- **MQTT**：支持远程控制与状态上报，可接入 Home Assistant 等平台。
 - **Home Assistant 自动发现**：接入 MQTT 后自动注册实体，无需手动配置。
 - **Modbus RTU 从机**（功能码 01/02/05/0F，地址 1 / 115200 / 8N1）：保留成品板原厂 RS485 能力，DAM 调试软件、RS485 上位机、HA Modbus 接入继续可用。
 - **WiFi 自动切换**：热点 / 家网自动切换，断网自愈重连。
@@ -36,22 +36,6 @@
 | binary_sensor | 流程完成 | 最近一次流程正常跑完 |
 | sensor | 上次结果 | 如「换水完成」「上水超时（T5）」 |
 | number | T0~T5 | 各阶段超时/延时参数 |
-
-### MQTT 主题
-
-基础前缀 `esp-pump/`：
-
-| 主题 | 方向 | 说明 |
-|---|---|---|
-| `esp-pump/relay1..4` | 状态 | 4 路继电器状态 |
-| `esp-pump/relay1..4/set` | 命令 | 控制继电器 |
-| `esp-pump/floatA` `floatB` | 状态 | 上下水位 |
-| `esp-pump/leak` | 状态 | 漏水报警 |
-| `esp-pump/boot` | 状态/命令 | 开机启动 |
-| `esp-pump/t0..t5` | 状态/命令 | 定时参数 |
-| `esp-pump/progress` | 状态 | 流程进度（网页/MQTT 共用） |
-| `esp-pump/cmd` | 命令 | `start` / `drain` / `fill` / `leak_reset` |
-| `esp-pump/ip` `diag` | 状态 | 设备 IP、诊断信息 |
 
 ## 软件界面
 
