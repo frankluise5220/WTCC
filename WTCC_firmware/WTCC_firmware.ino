@@ -1,4 +1,4 @@
-/* v5.25 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.26 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -81,7 +81,7 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.25"
+#define FW_VER   "v5.26"
 #define FW_BUILD __DATE__ " " __TIME__
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
@@ -217,6 +217,28 @@
  * ⚠ 教训：#define 一个库的配置宏，只有在**库自己也用这个宏**且**在库的编译单元里可见**时才有效。
  *   .ino 里 define 库宏 = 基本无效。要么改库源码，要么找库提供的运行时 setter。
  * ⚠ 以后再加长 device / 实体名，先算一遍报文长度，别超 1024（现在还有 3 倍余量）。
+ */
+
+/* ======== v5.26：阀开永远受上水位限制（最外层硬闸门，根治 2026-11-12 漫水）========
+ * 背景：漫水事故根因是「手动开阀路径完全不检查上水位」+「holdOk 宽限方向反了」+
+ *   「T5 被调成 900s」三缺陷叠加。用户明确要求：上水位的保护必须最严格、不可绕过，
+ *   硬件侧由浮球常闭触点直接串进电磁阀供电回路（程序碰不到的物理闸门）承担，
+ *   固件侧则在【所有开阀命令最终汇流的 pumpOut() 最底层】加一道软件闸门作纵深防御。
+ * 改动 1（硬闸门）：新增 fillBlocked() = trigAny(SEN_B, RED_B, senBPol)（上水位到位=禁开阀），
+ *   在 applyRelays(f,r,v,a) 最底层 v 为真且 fillBlocked() 时强制 v=false。applyRelays 是
+ *   【唯一真正写继电器】的函数，所有开阀动作（自动上水/手动 valve_on/HA relay3/set/MQTT/
+ *   串口/Modbus RTU 上位机）最终都汇流到这里 —— 这一处闸门任何路径都绕不过去，
+ *   漏掉任何一路（包括 RS485 上位机直写线圈）都不会再漏水。泵(f/r)与备用(a)不受此限制。
+ * 改动 2（手动开阀也服从上水位）：man() 里 v 为真时先显式检查 fillBlocked()，到位则拒绝
+ *   并报「上水位到位禁止开阀」；开阀成功后进入新状态 MAN_VALVE（不再 st=IDLE），
+ *   状态机持续监听上水位，浮球到位立即关阀，并以 T5 兜底超时 —— 堵住缺陷 A 前后两半。
+ * 改动 3（纠正 holdOk 宽限方向）：v5.11 给 pol=0 加的 3 秒「信号丢失宽限」方向反了 ——
+ *   trig 参数经 trigAny() 已翻译成「到位」纯语义，再拿 pol 判一次导致 pol=0 时"到位"
+ *   被当成"信号丢失"先宽限 3 秒才停，浮球到位反而多灌 3 秒水。现在统一为「到位即停」，
+ *   消抖由 trigS() 的 30ms SEN_CONFIRM_MS 承担，浮球是机械干簧管、到位是稳定状态，
+ *   不需要秒级宽限。对上水的约束因此做到最严格：到位即停，绝无延迟。
+ * ⚠ 验证：空载跑四种极性组合（信号{通,断}×规则{通,断}），逐条确认「该停时停、该续时续」；
+ *   重点回归「网页/HA 手动开阀 → 拨浮球到位 → 阀必须自动关」。
  */
 
 /* ======== v5.25：修 HA 实体全部消失 —— 发现报文少了外层 `}`（v5.21 引入）========
@@ -611,7 +633,7 @@ char mqttPass[64] = { 0 };
 byte planEn[MAX_PLAN], planType[MAX_PLAN], planParam[MAX_PLAN], planHour[MAX_PLAN], planMin[MAX_PLAN], planObj[MAX_PLAN];
 uint16_t planRef[MAX_PLAN];
 
-enum { IDLE, FWD, REV, T4REV, GAP, VALVE_ON, T5TO, END } st = IDLE;
+enum { IDLE, FWD, REV, T4REV, GAP, VALVE_ON, T5TO, END, MAN_VALVE } st = IDLE;
 bool leakNow  = false;   // 浸水传感器实时状态（true=浸水）
 bool leakLatch = false;  // 漏水保护自锁：true 时禁止一切启动，必须人工复位
 const char* manSt = "待机";       // 手动状态显示（空闲/无动作，与 stName 的待机统一，不再用「停止」）
@@ -710,8 +732,14 @@ bool relayOn(int pin) {
   if (pin == RLY4) return (relayState & 0x08) != 0;
   return false;
 }
+bool fillBlocked();   // v5.26 前置声明（定义在 trigAny 之后）：上水位到位=禁开阀
 // 原子写：一次设置全部 4 路，保证互斥不会中间态导致泵反转与正转同时吸合
 void applyRelays(bool f, bool r, bool v, bool a) {
+  /* v5.26 硬闸门（最外层、不可绕过）：上水位已到位时，任何请求都无法把阀打开。
+   * 放在 applyRelays 最底层 —— 这是唯一真正写继电器的地方，所有开阀路径
+   * （自动上水/手动 valve_on/HA relay3/set/MQTT/串口/Modbus RTU 上位机）最终都汇流到这里。
+   * 在这里把 v 清零 = 物理输出前的最后一道闸门把阀锁死。泵(f/r)与备用(a)不受此限制。 */
+  if (v && fillBlocked()) v = false;
   byte want = 0;
   if (f) want |= 0x01;
   if (r) want |= 0x02;
@@ -733,7 +761,7 @@ void setOutAll(int f, int r, int v, int a) { applyRelays(f, r, v, a); }
 /* TKS-M8 单键电平泵：把「正转/反转/停」翻译成「供电+信号」两路继电器落点。
  * 参数仍是上层语义（f=正转 r=反转），本函数内部换算成 TKS 需要的物理电平：
  *   #1=供电(RLY1)  #2=K1信号(RLY2)
- * 阀 v 原样透传给 #3。 */
+ * 阀 v 原样透传给 #3。（v5.26：上水位硬闸门在 applyRelays 底层，这里无需重复。） */
 void pumpOut(bool f, bool r, bool v) {
 #if TKS_SINGLE_KEY
   bool pwr = (f || r);   // 正转或反转都要供电；停=断电
@@ -765,26 +793,27 @@ bool trigAny(int p1, int p2, bool activeLow) {   // 主 + 备用，任一到位�
   return trigS(p1, activeLow);
 #endif
 }
-/* v5.11：「到位」是否确认生效。
- * 两种极性的"保持"语义本来就不同，所以停机判定不能一刀切：
- *   pol=1 通电时停止 —— 信号出现【就是】到位事件（浮球闭合后不会自己松开），出现即停，不宽限。
- *   pol=0 断电时停止 —— 信号是"允许工作"的许可证，要求【持续存在】。这种条件天然会波动，
- *                       所以丢失后先给 HOLD_GRACE_MS 宽限，连续丢失够久才确认到位；
- *                       期间恢复就撤销宽限，流程继续跑（否则一次接触不良就废掉整轮换水）。
- * lost/t0 是调用方传进来的状态变量（A/B 两路各一套）。
- * 返回 true = 确认到位，调用方可以停机/跳转。 */
+/* v5.26：上水位「禁止开阀」硬闸门（最外层约束）。
+ * 上水位的保护是【最高优先级、不可绕过】的：无论自动上水、手动开阀、HA、MQTT、串口，
+ * 只要上水位已到位，电磁阀就【不允许】打开。这道闸门放在所有开阀路径最终汇流的
+ * pumpOut() 里，而不是分散到每条命令 —— 漏掉任何一条路径都不会再漏水。
+ * 注意：这里只约束【阀(v)】，泵正转/反转(f/r)不受上水位限制（排水是另一条链路）。 */
+bool fillBlocked() {
+  return trigAny(SEN_B, RED_B, senBPol);   // 上水位已到位 = 禁止开阀
+}
+/* v5.26：水位「到位」判定 —— 到位即停，不做宽限（修复缺陷 B）。
+ * 背景：v5.11 起这里对 pol=0（断开时停止）加了 3 秒「信号丢失宽限」，
+ *   本意是防抖动，但方向搞反了 —— trig 参数经 trigAny() 已经翻译成「到位」纯语义
+ *   （无论 pol=0/1，trig=true 都表示"水位已到位，该停了"），
+ *   再拿 pol 判一次，导致 pol=0 时"到位"被当成"信号丢失"，先宽限 3 秒才停，
+ *   反而在浮球到位的那一刻多灌了 3 秒水 —— 正是 2026-11-12 漫水的放大因素之一。
+ * 现在统一为：trig=true（到位）立即返回 true（停）。消抖已由 trigS() 的
+ *   30ms SEN_CONFIRM_MS 承担，浮球是机械干簧管、到位是稳定状态，不需要秒级宽限。
+ *   对上水的约束因此做到最严格：到位即停，绝无延迟。
+ * lost/t0 参数为兼容调用方签名保留，不再参与逻辑。 */
 bool holdOk(byte pol, bool trig, bool& lost, unsigned long& t0, const char* what) {
-  if (!trig) {
-    if (lost) { lost = false; evLog("RUN", String(what) + "信号恢复，继续运行"); }
-    return false;
-  }
-  if (pol != 0) return true;                       // 通电时停止：出现即到位
-  if (!lost) {
-    lost = true; t0 = millis();
-    evLog("RUN", String(what) + "信号丢失，宽限 " + String(HOLD_GRACE_MS / 1000) + " 秒");
-    return false;
-  }
-  return (millis() - t0 >= (unsigned long)HOLD_GRACE_MS);
+  (void)pol; (void)lost; (void)t0; (void)what;
+  return trig;   // 到位即停，不做宽限（日志由调用方在状态跳转时打一次，避免刷屏）
 }
 
 const char* onoff(bool b) { return b ? "ON" : "OFF"; }
@@ -794,7 +823,7 @@ const char* stName() {
   switch (st) {
     case FWD: return "正转"; case REV: return "反转"; case T4REV: return "超时反转";
     case GAP: return "停止"; case VALVE_ON: return "阀开"; case T5TO: return "超时关阀";
-    case END: return "结束"; default: return manSt;
+    case MAN_VALVE: return "手动上水"; case END: return "结束"; default: return manSt;
   }
 }
 // 泵语义状态（0停/1正转/2反转）。progressText() 要用它，而它的定义在本文件后半部分，
@@ -820,6 +849,7 @@ const char* progressText() {
       return gapBuf;
     }
     case VALVE_ON: return "上水阀打开";
+    case MAN_VALVE: return "手动上水阀打开";
     case T5TO: return "上水阀停止（超时）";
     /* END 两种来路：纯排水流程反转完（obj=1），或换水/上水流程上水位到位。 */
     case END: return runObj == 1 ? "排水结束" : "上水阀停止（上水位触发）";
@@ -1626,6 +1656,16 @@ void man(int f, int r, int v) {
     evLog(evSrc, "手动操作被拒：漏水锁定");
     return;
   }
+  /* v5.26：手动开阀也必须服从上水位（最外层约束，针对缺陷 A 的直接根治）。
+   * 上水位已到位时，手动开阀直接拒绝并明确报因 —— 不靠 pumpOut 底层静默清零
+   * （那样状态卡会误显示「阀开」，用户以为开了其实没开）。 */
+  if (v && !f && !r && fillBlocked()) {
+    st = IDLE; pumpOut(0, 0, 0);
+    manSt = "上水位到位禁止开阀";
+    snprintf(lastResult, sizeof(lastResult), "开阀被拒：上水位已到位");
+    evLog(evSrc, "手动开阀被拒：上水位已到位");
+    return;
+  }
   holdALost = false; holdBLost = false;           // 手动接管：宽限状态一并作废
   /* v5.19：全关时记下「关掉的是什么」，给用户一个明确回执。
    * 以前一律写「待机」，网页只能显示「当前没有任务」—— 点「关阀」后看不出到底关没关，
@@ -1633,7 +1673,12 @@ void man(int f, int r, int v) {
    * 必须在 pumpOut 之前读实际输出，之后再读就已经全断了。 */
   bool wasValve = relayOn(RLY3);
   bool wasPump  = (pumpState() != 0);
-  st = IDLE; pumpOut(f, r, v);
+  /* v5.26：手动【开阀】(v 且无泵) 进入 MAN_VALVE 看护，而不是 IDLE ——
+   * 这样状态机会持续监听上水位，浮球到位立即关阀（缺陷 A 的后半段）。
+   * 手动开泵(f/r)仍走 IDLE，因为泵不受上水位约束、也无超时语义。 */
+  if (v && !f && !r) { st = MAN_VALVE; tmr = millis(); }
+  else st = IDLE;
+  pumpOut(f, r, v);
   doneFlag = false;                               // v5.20：手动接管 → 上一轮的「完成」作废
   if (f) manSt = "正转";
   else if (r) manSt = "反转";
@@ -3194,15 +3239,14 @@ void loop() {
   if (st == IDLE) return;                      // 空闲：不跑状态机
   switch (st) {
     case FWD:
-      /* v5.11：断电时停止（pol=0）下，信号丢失先给宽限、泵继续正转；
-       *        宽限内恢复就撤销，连续丢失超过 HOLD_GRACE_MS 才确认到位跳反转。
-       *        pol=1 仍是"出现即到位"，holdOk 直接返回 true，行为与 v5.10 完全一致。 */
+      /* v5.26：下水位到位即停（holdOk 已统一为"到位即停"，不再有 3 秒宽限）。
+       *        消抖由 trigS() 的 30ms 承担。 */
       if (holdOk(senAPol, trigAny(SEN_A, RED_A, senAPol), holdALost, holdAT0, "下水位")) {
         holdALost = false;
         evLog("RUN", "下水位到位 → 泵反转 T1");
         st = REV; tmr = millis(); pumpOut(0, 1, 0);
       }
-      else if (millis() - tmr >= cfgT4 * 1000UL) {     // 宽限期间 T4 照常兜底
+      else if (millis() - tmr >= cfgT4 * 1000UL) {     // T4 照常兜底
         holdALost = false;
         evLog("RUN", "T4 超时：泵正转超时 → 强制反转");
         st = T4REV; tmr = millis(); pumpOut(0, 1, 0);
@@ -3222,16 +3266,37 @@ void loop() {
       }
       break;
     case VALVE_ON:
-      /* 同 FWD：pol=0 时信号是"许可证"，掉一下不立刻关阀，宽限内恢复就继续上水。 */
+      /* v5.26：上水位到位即停（holdOk 统一为"到位即停"，不再有 3 秒宽限）。 */
       if (holdOk(senBPol, trigAny(SEN_B, RED_B, senBPol), holdBLost, holdBT0, "上水位")) {
         holdBLost = false;
         evLog("RUN", "上水位到位 → 关阀，流程完成");
         st = END; tmr = millis(); pumpOut(0, 0, 0);
       }
-      else if (millis() - tmr >= cfgT5 * 1000UL) {     // 宽限期间 T5 照常兜底
+      else if (millis() - tmr >= cfgT5 * 1000UL) {     // T5 照常兜底
         holdBLost = false;
         evLog("RUN", "T5 超时：上水超时 → 强制关阀");
         st = T5TO; tmr = millis(); pumpOut(0, 0, 0);
+      }
+      break;
+    case MAN_VALVE:
+      /* v5.26：手动开阀后的持续看护（缺陷 A 后半段）。
+       * 手动开阀期间同样监听上水位，浮球到位立即关阀；同时用 T5 做超时兜底，
+       * 否则手动开阀会无限进水。关阀后回 IDLE（给一个明确的「手动上水到位关阀」回执）。 */
+      if (holdOk(senBPol, trigAny(SEN_B, RED_B, senBPol), holdBLost, holdBT0, "上水位")) {
+        holdBLost = false;
+        evLog("RUN", "手动上水：上水位到位 → 关阀");
+        st = IDLE; tmr = millis(); pumpOut(0, 0, 0);
+        manSt = "手动上水到位关阀";
+        snprintf(lastResult, sizeof(lastResult), "手动上水：上水位到位关阀");
+        runSrc = evSrc;
+      }
+      else if (millis() - tmr >= cfgT5 * 1000UL) {     // 手动上水也要有 T5 兜底
+        holdBLost = false;
+        evLog("RUN", "手动上水超时 → 强制关阀");
+        st = IDLE; tmr = millis(); pumpOut(0, 0, 0);
+        manSt = "手动上水超时关阀";
+        snprintf(lastResult, sizeof(lastResult), "手动上水超时（T5）强制关阀");
+        runSrc = evSrc;
       }
       break;
     case T5TO:
