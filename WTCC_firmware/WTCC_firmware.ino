@@ -2243,7 +2243,11 @@ function upd(s){
   var _d2=document.getElementById('d2');if(_d2)_d2.classList.toggle('on',s.pump==2);
   cur.r1=s.r1;cur.r2=s.r2;cur.r3=s.r3;cur.r4=s.r4;cur.pump=s.pump||0;
   cur.obj=s.obj||0;
-  var running = !s.ended && s.phase!='待机' && s.phase!='漏水保护';
+  /* v5.26：running 直接信固件的 auto 字段（auto=1 才代表自动流程真的在跑）。
+   * 原来用 !ended && phase!='待机' && phase!='漏水保护' 这个排除法判断，
+   * 会把「手动」状态误判成 running=true —— 手动停止后 phase='手动' 且 obj 残留上次的值，
+   * 导致「换水」按钮（obj==0）明明没在跑也亮着黄圈（.act）。 */
+  var running = s.auto==1;
   cur.running=running;
   // v5.15：状态卡片里那行「固件 vX · 编译 …」删掉了 —— 系统页「固件升级」卡片已经显示
   // 当前版本（#fwCur），同一串信息没必要在首页再写一遍。
