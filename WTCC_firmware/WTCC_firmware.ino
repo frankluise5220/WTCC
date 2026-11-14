@@ -1,4 +1,4 @@
-/* v5.26 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.27 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -59,6 +59,7 @@
  *       （/set 为控制；cmd 支持 start/drain/fill/leak_reset 等）
  */
 #include <WiFi.h>
+#include <esp_wifi.h>      // v5.27 WiFi 省电控制：esp_wifi_set_ps(WIFI_PS_NONE) 关闭 modem sleep
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <ESPmDNS.h>
@@ -81,7 +82,7 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.26"
+#define FW_VER   "v5.27"
 #define FW_BUILD __DATE__ " " __TIME__
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
@@ -970,14 +971,18 @@ void ledTask() {
 //   热点就静默消失，且再无恢复机会 —— 只能断电重启。
 // 读 core 3.3.11 源码：`softAP()` → `AP.begin()` → `WiFi.enableAP(true)` → mode(currentMode | WIFI_MODE_AP)，
 //   理论上能自己补回模式位，所以失败概率不高；**失败后无人兜底**才是真问题。这里做三件事：
-//   ① 先显式 `WiFi.mode(WIFI_AP_STA)` 把模式钉死；② 检查返回值；③ 失败延迟重试一次。
+//   ① 先显式 `WiFi.mode(WIFI_AP_STA)` 把模式钉死；② 检查返回值；③ 失败再试一次。
 // 注意不能拿纯 `WIFI_AP` 兜底 —— 那会把 STA 一起关掉，家网也断了。
+// v5.27 加固：去掉原 `delay(120)/delay(300)` 阻塞式重试 —— setup() 里一旦 softAP()
+//   连续失败，阻塞 delay 会拖住 setup 迟迟返回，loop 里的 5 秒自愈巡检根本没机会跑，
+//   等于自愈形同虚设。改为非阻塞：失败即返回，交给 loop 自愈；只在两次尝试之间给
+//   极短的 yield 让驱动有机会缓过来（不阻塞主流程）。
 bool startAP() {
   WiFi.mode(WIFI_AP_STA);                 // 关键是这一步：补回 AP 模式位
-  delay(120);
   if (WiFi.softAP("FS_TWCC")) return true;
-  delay(300);
-  return WiFi.softAP("FS_TWCC");          // 再试一次；还失败就交给 5 秒后的自愈巡检重试
+  // 再试一次；还失败就交给 loop 里每 5 秒一次的自愈巡检重试（真正兜底）
+  yield();
+  return WiFi.softAP("FS_TWCC");
 }
 
 /* 恢复出厂设置（BOOT 按住 10 秒）：把 EEPROM 里**所有**可配置项写回默认值，
@@ -3072,6 +3077,11 @@ void setup() {
   // 压到 2 秒即可让网页保持响应，代价只是 MQTT 重连更频繁地重试。
   mqtt.setSocketTimeout(2);
   WiFi.mode(WIFI_AP_STA);
+  // v5.27：关闭 WiFi modem sleep。ESP32 默认开省电，空闲几十 ms 后射频打盹，
+  // 导致热点/家网下的 HTTP 响应多出几十~几百 ms 延迟（网页转圈、点击卡顿）。
+  // 本板 7×24 跑 WebServer+MQTT，省这点电没意义，反牺牲响应速度。
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   bool apok = startAP();
   // v5.3h 启动诊断：把"热点到底起来没有 / 配的哪个家网"直接打在串口上，
   // 以后再出现"搜不到 FS_TWCC"就不必猜 —— 看这一行即可。
