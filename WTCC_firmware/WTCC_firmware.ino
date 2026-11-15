@@ -1,4 +1,4 @@
-/* v5.27 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.28 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -60,6 +60,7 @@
  */
 #include <WiFi.h>
 #include <esp_wifi.h>      // v5.27 WiFi 省电控制：esp_wifi_set_ps(WIFI_PS_NONE) 关闭 modem sleep
+#include <esp_timer.h>     // v5.28 任务级看门狗：独立后台定时器，loop 卡死自动重启自愈
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <ESPmDNS.h>
@@ -82,8 +83,21 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.27"
+#define FW_VER   "v5.28"
 #define FW_BUILD __DATE__ " " __TIME__
+
+/* ======== v5.28：根治「偶发卡死、只能手动上电」========
+ * 症状（2026-11-15 实测）：HA 控制换水突然无反应。板子 80 端口 TCP 能握手，
+ *   但 HTTP 请求 8 秒 0 字节返回、MQTT 指令收不到 —— 典型 loop 卡死：
+ *   WiFi 栈在独立任务里还活着，但 WebServer/MQTT/Modbus 全依赖的 loop() 不再跑。
+ *   事件日志不落盘、诊断全走串口（现场未接），卡死瞬间无法追溯 → 反复「老不正常」。
+ * 加固三招：
+ *   ① 任务级看门狗：esp_timer 独立后台定时器每秒核对 loop 喂狗时间，
+ *      loop 卡死超 30 秒自动 ESP.restart() 自愈，无需人工上电（见 wdgCb）。
+ *   ② MQTT 半开连接防护：mqttPubStates 里 17 条 publish 改用 tryPub + 耗时守卫，
+ *      半开连接下累计阻塞超 15 秒即主动 disconnect 放弃本轮，不再把 loop 耗干。
+ *   ③ 前两版已埋的加固（v5.27 关 modem sleep / startAP 去阻塞；v5.3m setSocketTimeout(2)）保持不变。
+ */
 
 /* ======== v5.9：网页改成页签切换（控制 / 设置 / 记录 / 系统）========
  * 起因：卡片从 8 张涨到 13 张，手机上要滚好几屏才能摸到「流程执行」那几个按钮。
@@ -397,6 +411,30 @@ char          lastHttpCmd[28] = "";
 unsigned long selfOkN = 0, selfFailN = 0, selfRtt = 0;
 unsigned long lastDiag = 0;
 unsigned long mqttBlkMs = 0;   // MQTT connect() 对 loop 的最大阻塞时长
+
+/* ==== v5.28 任务级看门狗（根治「偶发卡死、只能手动上电」）====
+ * 背景：WebServer / MQTT / Modbus / 网页 OTA 全部依赖同一个 loop() 驱动，
+ *   一旦 loop 被某个阻塞调用（MQTT 半开连接、OTA 等）卡住，整个设备就「假死」：
+ *   TCP 还能握手（WiFi 栈在另一个任务里），但 HTTP 不响应、MQTT 指令收不到——
+ *   正是「HA 控制换水没反应」的典型现场，且日志不落盘，卡死瞬间无法追溯。
+ * 做法：用 esp_timer 起一个独立后台定时器，每秒核对一次「loop 最近喂狗时间」。
+ *   定时器回调运行在系统后台，不依赖 loop 本身 —— loop 卡得再死，定时器照常跑，
+ *   一旦发现 loop 超过 WDG_TIMEOUT_MS 没喂狗，立即 ESP.restart() 自愈。
+ * 喂狗点：loop() 入口。这样即便偶发卡死，几十秒后自动重启恢复，无需人工干预。
+ * 阈值 30 秒：远大于正常 loop 间隔（毫秒级），又远小于「发现故障到恢复」的容忍度；
+ *   不会被 MQTT 正常重连（setSocketTimeout 已压到 2 秒）误触，也能兜住真正的死锁。 */
+#define WDG_TIMEOUT_MS 30000UL          // loop 超过 30 秒没喂狗 → 判死，重启自愈
+volatile unsigned long wdgLastFeed = 0; // 最近一次喂狗的 millis()（loop 写，定时器读）
+static void wdgCb(void*) {
+  // 首次定时器触发时 wdgLastFeed 可能还是 0（setup 尚未跑完/刚进 loop），
+  // 用「非零且超时」判定，避免开机瞬间误重启。
+  if (wdgLastFeed != 0 && (millis() - wdgLastFeed) > WDG_TIMEOUT_MS) {
+    // 重启前尽量留一条串口线索（若接了串口），再干净重启。
+    Serial.printf("[WDG] loop 卡死 %lums，触发自愈重启\r\n", (unsigned long)(millis() - wdgLastFeed));
+    delay(50);
+    ESP.restart();
+  }
+}
 /* ---- ESP32-32E 引脚映射（经典 ESP32，与 C3 完全不兼容）---- */
 #define RLY1 23        // 继电器#1 泵正转（驱动级反相：LOW=吸合）
 #define RLY2 5         // 继电器#2 泵反转
@@ -1569,28 +1607,41 @@ int pumpState() {
 }
 void mqttPubStates() {
   if (!mqtt.connected()) return;
-  mqtt.publish("esp-pump/floatA", onoff(trigAny(SEN_A, RED_A, senAPol)));
-  mqtt.publish("esp-pump/floatB", onoff(trigAny(SEN_B, RED_B, senBPol)));
+  /* v5.28：半开连接防护。mqtt.connected() 只反映本地 TCP 是否仍「认为」连着，
+   * 对端 broker 若已断开（半开），下面每条 publish 都会在 client.flush() 等 TCP
+   * 确认，最多各卡到 setSocketTimeout(2s)。17 条累积就是 30+ 秒的 loop 阻塞，
+   * 直接把 WebServer/MQTT 订阅全部拖死 —— 与「TCP 能握手、HTTP 不响应」吻合。
+   * 修法：① 全部改用 tryPub（显式传长度、返回 bool）；② 记录本轮耗时，
+   *   一旦超过 WDG 阈值的一半就主动 disconnect，放弃本轮剩余发布，
+   *   下次 loop 走 mqttConnect() 重建，而不是卡在原地把 loop 耗干。 */
+  unsigned long t0 = millis();
+  #define PUB_GUARD(topic, val) \
+    do { if (millis() - t0 > 15000UL) { mqtt.disconnect(); return; } \
+         tryPub(topic, val); } while (0)
+
+  PUB_GUARD("esp-pump/floatA", onoff(trigAny(SEN_A, RED_A, senAPol)));
+  PUB_GUARD("esp-pump/floatB", onoff(trigAny(SEN_B, RED_B, senBPol)));
   // relay1/relay2 按泵语义发布：正转时只 relay1=ON，反转时只 relay2=ON，
   // 单键模式下不再出现「供电+信号都吸合 → 两灯同亮」。
   int ps = pumpState();
-  mqtt.publish("esp-pump/relay1", onoff(ps == 1));
-  mqtt.publish("esp-pump/relay2", onoff(ps == 2));
-  mqtt.publish("esp-pump/relay3", onoff(relayOn(RLY3)));
-  mqtt.publish("esp-pump/relay4", onoff(relayOn(RLY4)));
-  mqtt.publish("esp-pump/leak", onoff(leakLatch));   // 漏水报警（自锁状态，非瞬时浸水）
-  mqtt.publish("esp-pump/boot", onoff(trig == 0));   // 开机启动：ON=是 OFF=否
-  mqtt.publish("esp-pump/t0", String(cfgT0).c_str());
-  mqtt.publish("esp-pump/t1", String(cfgT1).c_str());
-  mqtt.publish("esp-pump/t2", String(cfgT2).c_str());
-  mqtt.publish("esp-pump/t4", String(cfgT4).c_str());
-  mqtt.publish("esp-pump/t5", String(cfgT5).c_str());
-  mqtt.publish("esp-pump/progress", progressText());   // 运行状态（进度阶段名）
+  PUB_GUARD("esp-pump/relay1", onoff(ps == 1));
+  PUB_GUARD("esp-pump/relay2", onoff(ps == 2));
+  PUB_GUARD("esp-pump/relay3", onoff(relayOn(RLY3)));
+  PUB_GUARD("esp-pump/relay4", onoff(relayOn(RLY4)));
+  PUB_GUARD("esp-pump/leak", onoff(leakLatch));   // 漏水报警（自锁状态，非瞬时浸水）
+  PUB_GUARD("esp-pump/boot", onoff(trig == 0));   // 开机启动：ON=是 OFF=否
+  PUB_GUARD("esp-pump/t0", String(cfgT0).c_str());
+  PUB_GUARD("esp-pump/t1", String(cfgT1).c_str());
+  PUB_GUARD("esp-pump/t2", String(cfgT2).c_str());
+  PUB_GUARD("esp-pump/t4", String(cfgT4).c_str());
+  PUB_GUARD("esp-pump/t5", String(cfgT5).c_str());
+  PUB_GUARD("esp-pump/progress", progressText());   // 运行状态（进度阶段名）
   /* v5.20：给 HA 的两个结果信号，别让自动化去匹配中文文案 */
-  mqtt.publish("esp-pump/done", onoff(doneFlag));      // ON=最近一次流程正常跑完
-  mqtt.publish("esp-pump/last", lastResult);           // 上次结果/被拒原因（文本）
-  mqtt.publish("esp-pump/ip", (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("仅热点")).c_str());
-  mqtt.publish("esp-pump/diag", (String(FW_VER) + " disc_fail:" + String(dispubFail)).c_str());
+  PUB_GUARD("esp-pump/done", onoff(doneFlag));      // ON=最近一次流程正常跑完
+  PUB_GUARD("esp-pump/last", lastResult);           // 上次结果/被拒原因（文本）
+  PUB_GUARD("esp-pump/ip", (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("仅热点")).c_str());
+  PUB_GUARD("esp-pump/diag", (String(FW_VER) + " disc_fail:" + String(dispubFail)).c_str());
+  #undef PUB_GUARD
 }
 void mqttConnect() {
   if (!mqttEn || mqttHost[0] == 0) return;
@@ -3070,6 +3121,18 @@ void setup() {
                 FW_VER, FW_BUILD, WTCC_BOARD_TAG);
   evLog("BOOT", String(FW_VER) + " 启动 · " + WTCC_BOARD_TAG);
 
+  // v5.28 任务级看门狗：起独立后台定时器，loop 卡死超 30 秒自动重启自愈。
+  // 必须先启动，才能兜住下面 WiFi.begin / mqttConnect 里万一出现的阻塞。
+  {
+    esp_timer_create_args_t wdgArgs = {};
+    wdgArgs.callback = wdgCb;
+    wdgArgs.name = "wdg";
+    esp_timer_handle_t wdgTimer = nullptr;
+    if (esp_timer_create(&wdgArgs, &wdgTimer) == ESP_OK) {
+      esp_timer_start_periodic(wdgTimer, 1000000);   // 每 1 秒触发一次
+    }
+  }
+
   mqtt.setCallback(mqttCb);
   // v5.3m 关键修复：PubSubClient 默认 socket 超时 15 秒。MQTT 服务器不可达时，
   // 每次 connect() 会把 loop 堵死十几秒，而 loop 每 5 秒就重试一次 —— 结果
@@ -3112,6 +3175,9 @@ void setup() {
 }
 
 void loop() {
+  // v5.28 喂狗：每次进 loop 都刷新看门狗时间戳。loop 卡死超过 30 秒，
+  // 后台定时器 wdgCb 会检测到并 ESP.restart() 自愈。
+  wdgLastFeed = millis();
   // v5.3m：loop 阻塞时长统计。若 >1000ms，说明有代码卡住主循环（WebServer 全靠 loop 驱动）
   unsigned long nowLoop = millis();
   if (loopLastMs) { unsigned long g = nowLoop - loopLastMs; if (g > loopMaxGap) loopMaxGap = g; }
