@@ -1,4 +1,4 @@
-/* v5.28 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
+/* v5.29 · WTCC 换水控制器固件 · 硬件 WTCC-ESP32-RLY4-V1
  * ⚠ 两个版本号各管一段，都要改：
  *    · 软件版本 = 下面的 #define FW_VER        → 改固件逻辑就动它
  *    · 硬件型号 = 后面的 HW_MODEL / HW_REV 宏   → 换板子/改电路才动
@@ -83,8 +83,20 @@
  * 所以"到底烧进去没有"看时间戳即可，不必再靠版本号猜。
  * 硬件型号另有 HW_MODEL / HW_REV（见文件前部「硬件身份」一节），不在这里。
  * ⚠ 改 FW_VER 时，把【文件第 1 行】的版本号一起改 —— 那行是给人一眼看版本用的。 */
-#define FW_VER   "v5.28"
+#define FW_VER   "v5.29"
 #define FW_BUILD __DATE__ " " __TIME__
+
+/* ======== v5.29：修正 v5.28 PUB_GUARD「15 秒阻塞」慢性毒药 ========
+ * 现象（2026-11-17）：升 v5.28 后「打不开网页」——首页加载 3~20 秒甚至超时，
+ *   但 /state 轻量接口秒回（0.05s）。根因：MQTT broker 是公网 107.175.62.109
+ *   （ping 195ms 高延迟），链路抖动易半开连接；mqtt.connected() 仍返回 true，
+ *   mqttPubStates 每条 publish 卡 socket 超时，v5.28 的 PUB_GUARD 阈值 15 秒太大，
+ *   导致 loop 每 10 秒被 MQTT 阻塞 ~15 秒，WebServer 请求排队 → 网页「打不开」。
+ * 修正：
+ *   ① PUB_GUARD 阈值 15s → 800ms（loop 永不被 MQTT 拖住超 1 秒）；
+ *   ② tryPub 返回 false 立即 disconnect（连接已坏不再逐条空转）；
+ *   ③ setSocketTimeout 2s → 1s（该函数单位是秒，1s 是最小值，亚秒级靠 PUB_GUARD）。
+ */
 
 /* ======== v5.28：根治「偶发卡死、只能手动上电」========
  * 症状（2026-11-15 实测）：HA 控制换水突然无反应。板子 80 端口 TCP 能握手，
@@ -1607,17 +1619,18 @@ int pumpState() {
 }
 void mqttPubStates() {
   if (!mqtt.connected()) return;
-  /* v5.28：半开连接防护。mqtt.connected() 只反映本地 TCP 是否仍「认为」连着，
-   * 对端 broker 若已断开（半开），下面每条 publish 都会在 client.flush() 等 TCP
-   * 确认，最多各卡到 setSocketTimeout(2s)。17 条累积就是 30+ 秒的 loop 阻塞，
-   * 直接把 WebServer/MQTT 订阅全部拖死 —— 与「TCP 能握手、HTTP 不响应」吻合。
-   * 修法：① 全部改用 tryPub（显式传长度、返回 bool）；② 记录本轮耗时，
-   *   一旦超过 WDG 阈值的一半就主动 disconnect，放弃本轮剩余发布，
-   *   下次 loop 走 mqttConnect() 重建，而不是卡在原地把 loop 耗干。 */
+  /* v5.28→v5.29 关键修正：PUB_GUARD 阈值 15 秒「太大」反成慢性毒药。
+   * 现象（2026-11-17）：MQTT broker 是公网 107.175.62.109（ping 195ms），链路抖动
+   *   极易半开连接。mqtt.connected() 仍返回 true，但每条 publish 卡 setSocketTimeout(2s)，
+   *   17 条 × 2s ≈ 34s；PUB_GUARD 虽在 15s 主动断开，但这 15s 阻塞本身就把 loop 拖死，
+   *   导致 WebServer 请求排队 3~20s → 浏览器「打不开网页」。
+   * 根治：① 阈值压到 800ms —— loop 永不被 MQTT 拖住超过 1 秒；② socket 超时压到 500ms；
+   *   ③ 任一 tryPub 返回 false（连接已坏）立即 disconnect，不再逐条空转。
+   *   这样半开连接最多让 loop 卡 ~0.8s，网页始终响应，下次 loop 走 mqttConnect 重建。 */
   unsigned long t0 = millis();
   #define PUB_GUARD(topic, val) \
-    do { if (millis() - t0 > 15000UL) { mqtt.disconnect(); return; } \
-         tryPub(topic, val); } while (0)
+    do { if (millis() - t0 > 800UL) { mqtt.disconnect(); return; } \
+         if (!tryPub(topic, val)) { mqtt.disconnect(); return; } } while (0)
 
   PUB_GUARD("esp-pump/floatA", onoff(trigAny(SEN_A, RED_A, senAPol)));
   PUB_GUARD("esp-pump/floatB", onoff(trigAny(SEN_B, RED_B, senBPol)));
@@ -3138,7 +3151,10 @@ void setup() {
   // 每次 connect() 会把 loop 堵死十几秒，而 loop 每 5 秒就重试一次 —— 结果
   // WebServer（完全依赖 loop 驱动）几乎抢不到 CPU，网页所有点击全部超时。
   // 压到 2 秒即可让网页保持响应，代价只是 MQTT 重连更频繁地重试。
-  mqtt.setSocketTimeout(2);
+  // v5.29 再压到 1 秒：setSocketTimeout 的单位是【秒】（库内部 *1000 传给 lwip），
+  //   最小值只能到 1。真正亚秒级的阻塞控制靠 mqttPubStates 里的 PUB_GUARD(millis 判 800ms)，
+  //   这里的 1 秒只是给 mqtt.connect()/mqtt.loop() 兜底，避免半开连接把 loop 堵死。
+  mqtt.setSocketTimeout(1);   // 单位：秒（PubSubClient 内部 *1000 转 ms 传给 lwip）
   WiFi.mode(WIFI_AP_STA);
   // v5.27：关闭 WiFi modem sleep。ESP32 默认开省电，空闲几十 ms 后射频打盹，
   // 导致热点/家网下的 HTTP 响应多出几十~几百 ms 延迟（网页转圈、点击卡顿）。
